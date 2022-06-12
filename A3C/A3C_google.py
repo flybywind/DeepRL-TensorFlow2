@@ -2,6 +2,7 @@ import argparse
 import sys
 sys.path.append("/Users/flybywind/Project/MachineLearning/DeepRL-TensorFlow2_marload")
 from Env import Maze
+import random
 import numpy as np
 import tensorflow as tf
 from typing import Tuple, List
@@ -17,6 +18,8 @@ parser.add_argument('--rand_seed', type=int, default=None)
 parser.add_argument('--episode', type=int, default=32)
 parser.add_argument('--max_step', type=int, default=10)
 parser.add_argument('--debug', type=bool, default=False)
+parser.add_argument('--explore_prob', type=float, default=0.5)
+parser.add_argument('--explore_decay', type=float, default=0.9)
 
 
 args = parser.parse_args()
@@ -71,22 +74,26 @@ class Environment:
     rob = self.env.get_rob()
     action_probs = tf.nn.softmax(action_logits_t)
     action_val = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
-    action_ind = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True)
+    action_ind = []
     i = 0
     for a in range(self.env.action_dim()):
       _, rwd, _ = self.env.action(a)
       loc = (rob[0], rob[1], a)
       if loc not in self.trace:
-        action_val.write(i, action_logits_t[0, a])
-        action_ind.write(i, a)
+        action_val = action_val.write(i, action_logits_t[0, a])
+        action_ind += [a]
         i += 1
       self.env.place_rob(rob)
-    action_logits_t = tf.expand_dims(action_val.stack(), 0)
-    action_ind = action_ind.stack()
-    if action_ind.shape == 0:
+    if len(action_ind) == 0:
       return tf.constant(-1), tf.constant(-1)
-    action = action_ind[tf.random.categorical(action_logits_t, 1)[0, 0]]
-    return action_probs[0, action], action
+
+    action_logits_t = tf.expand_dims(action_val.stack(), 0)
+    if random.random() < args.explore_prob:
+      action = random.choice(action_ind)
+    else:
+      action = action_ind[tf.random.categorical(action_logits_t, 1)[0, 0]]
+    print(f"at loc {rob}, select action: {action}")
+    return action_probs[0, action], tf.constant(action)
 
   # Wrap `env.action` call as an operation in a TensorFlow function.
   # This would allow it to be included in a callable TensorFlow graph.
@@ -148,27 +155,53 @@ class Environment:
 
     return actor_loss, critic_loss
 
-  def run_episode(self,
-                  initial_state: tf.Tensor,
-                  max_steps: int) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Runs a single episode to collect training data."""
-    action_probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
-    values = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
-    rewards = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True)
 
-    initial_state_shape = initial_state.shape
+  def try_episode(self,
+                  initial_state: tf.Tensor,
+                  max_steps: int) -> Tuple[tf.Tensor, tf.Tensor]:
+    """try a single episode to collect winning path"""
+    actions = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True)
     state = initial_state
     for t in tf.range(max_steps):
       # Run the model and to get action probabilities and critic value
       action_logits_t, value = self.model(state)
+      # Store log probability of the action chosen
+      _, action = self.select_action(action_logits_t)
+      if tf.equal(action, -1):
+        print("reach dead loop! reset from start ...")
+        return actions.stack(), tf.constant(False)
+
+
+      # Store action paths
+      actions = actions.write(t, action)
+      # Apply action to the environment to get next state and reward
+      _, _, done = self.tf_env_step(action)
+      done = tf.cast(done, tf.bool)
+      if done:
+        print("Game Win Finally")
+        break
+
+    actions = actions.stack()
+    return actions, done
+
+  def run_episode(self,
+                  initial_state: tf.Tensor,
+                  actions: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Runs a single episode to collect training data."""
+    initial_state_shape = initial_state.shape
+    state = initial_state
+    action_probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+    values = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+    rewards = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True)
+    t = 0
+    for action in actions:
+      # Run the model and to get action probabilities and critic value
+      action_logits_t, value = self.model(state)
+      # Store log probability of the action chosen
+      action_prob = tf.nn.softmax(action_logits_t)[0, action]
+
       # Store critic values
       values = values.write(t, tf.squeeze(value))
-
-      # Store log probability of the action chosen
-      action_prob, action = self.select_action(action_logits_t)
-      if action == -1:
-        print("reach dead loop!")
-        break
       action_probs = action_probs.write(t, action_prob)
 
       # Apply action to the environment to get next state and reward
@@ -180,6 +213,7 @@ class Environment:
 
       if tf.cast(done, tf.bool):
         break
+      t += 1
 
     action_probs = action_probs.stack()
     values = values.stack()
@@ -193,10 +227,15 @@ def train_step(env: Environment) -> (tf.Tensor, tf.Tensor, tf.Tensor):
   """Runs a model training step."""
   env.reset()
   initial_state = tf.constant(env.get_state())
+  Done = False
+  actions = None
+  while not Done:
+    actions, Done = env.try_episode(initial_state, args.max_step)
+    env.reset()
+
   with tf.GradientTape() as tape:
     # Run the model for one episode to collect training data
-    action_probs, values, rewards = env.run_episode(
-      initial_state, args.max_step)
+    action_probs, values, rewards = env.run_episode(initial_state, actions)
 
     # Calculate expected returns
     returns = env.get_expected_return(rewards, True)
